@@ -1,0 +1,14 @@
+{
+  "subnet": "10.0.2.0/24",
+  "description": "Database server - Only MySQL port allowed from internal",
+  "ingress": [
+    {"port": 3306, "protocol": "tcp", "action": "allow"},
+    {"port": 5432, "protocol": "tcp", "action": "allow"},
+    {"port": 22, "protocol": "tcp", "action": "deny"},
+    {"port": 80, "protocol": "tcp", "action": "deny"}
+  ],
+  "egress": [
+    {"port": 80, "protocol": "tcp", "action": "deny"},
+    {"port": 443, "protocol": "tcp", "action": "deny"}
+  ]
+}

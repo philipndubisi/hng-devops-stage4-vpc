@@ -1,0 +1,6 @@
+logs/vpcctl.log
+configs/vpc_state.txt
+*.swp
+*.swo
+*~
+.DS_Store

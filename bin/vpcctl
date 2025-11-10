@@ -1,0 +1,1067 @@
+#!/bin/bash
+set -euo pipefail  # Exit on errors, undefined variables, pipe failures
+
+LOG_DIR="logs"
+CONFIG_DIR="configs"
+STATE_FILE="$CONFIG_DIR/vpc_state.txt"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m'
+
+log() {
+    local level=$1
+    shift
+    local message="$*"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    echo "[$timestamp] [$level] $message" >> "$LOG_DIR/vpcctl.log"
+    
+    case $level in
+        INFO)    echo -e "${GREEN}✓${NC} $message" ;;
+        WARN)    echo -e "${YELLOW}⚠${NC} $message" ;;
+        ERROR)   echo -e "${RED}✗${NC} $message" ;;
+        DEBUG)   echo -e "${BLUE}ℹ${NC} $message" ;;
+        SUCCESS) echo -e "${CYAN}★${NC} $message" ;;
+    esac
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log ERROR "This script must be run with sudo"
+        log ERROR "Usage: sudo ./bin/vpcctl <command>"
+        exit 1
+    fi
+}
+
+init() {
+    mkdir -p "$LOG_DIR" "$CONFIG_DIR" "configs/example-policies"
+    
+    if [[ ! -f "$STATE_FILE" ]]; then
+        touch "$STATE_FILE"
+        log INFO "Initialized state file: $STATE_FILE"
+    fi
+}
+
+check_dependencies() {
+    local missing_deps=()
+    
+    for tool in ip iptables python3; do
+        if ! command -v "$tool" &> /dev/null; then
+            missing_deps+=("$tool")
+        fi
+    done
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        log ERROR "Missing required tools: ${missing_deps[*]}"
+        log ERROR "Please install them before running vpcctl"
+        exit 1
+    fi
+    
+    if ! command -v jq &> /dev/null; then
+        log WARN "jq is not installed (optional but recommended for JSON parsing)"
+        log INFO "Install with: sudo apt-get install jq (Ubuntu/Debian)"
+    fi
+}
+
+vpc_exists() {
+    local vpc_name=$1
+    grep -q "^VPC:$vpc_name:" "$STATE_FILE" 2>/dev/null
+}
+
+subnet_exists() {
+    local vpc_name=$1
+    local subnet_name=$2
+    grep -q "^SUBNET:$vpc_name:$subnet_name:" "$STATE_FILE" 2>/dev/null
+}
+
+validate_port() {
+    local port=$1
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+validate_protocol() {
+    local protocol=$1
+    if [[ "$protocol" != "tcp" && "$protocol" != "udp" && "$protocol" != "icmp" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+validate_policy_file() {
+    local policy_file=$1
+    
+    log DEBUG "Validating policy file: $policy_file"
+    
+
+    if [[ ! -f "$policy_file" ]]; then
+        log ERROR "Policy file not found: $policy_file"
+        return 1
+    fi
+    
+    if command -v jq &> /dev/null; then
+        if ! jq empty "$policy_file" 2>/dev/null; then
+            log ERROR "Invalid JSON syntax in policy file"
+            return 1
+        fi
+        
+        local ingress_count=$(jq '.ingress | length' "$policy_file" 2>/dev/null || echo "0")
+        if [[ "$ingress_count" -gt 0 ]]; then
+            log DEBUG "Validating $ingress_count ingress rules..."
+            
+            local idx=0
+            while [[ $idx -lt $ingress_count ]]; do
+                local port=$(jq -r ".ingress[$idx].port" "$policy_file" 2>/dev/null)
+                local protocol=$(jq -r ".ingress[$idx].protocol" "$policy_file" 2>/dev/null)
+                local action=$(jq -r ".ingress[$idx].action" "$policy_file" 2>/dev/null)
+                
+                if ! validate_port "$port"; then
+                    log ERROR "Invalid port in ingress rule $idx: $port (must be 1-65535)"
+                    return 1
+                fi
+                
+                if ! validate_protocol "$protocol"; then
+                    log ERROR "Invalid protocol in ingress rule $idx: $protocol (must be tcp/udp/icmp)"
+                    return 1
+                fi
+            
+                if [[ "$action" != "allow" && "$action" != "deny" ]]; then
+                    log ERROR "Invalid action in ingress rule $idx: $action (must be allow/deny)"
+                    return 1
+                fi
+                
+                ((idx++))
+            done
+            log DEBUG "All ingress rules validated successfully"
+        fi
+        
+        local egress_count=$(jq '.egress | length' "$policy_file" 2>/dev/null || echo "0")
+        if [[ "$egress_count" -gt 0 ]]; then
+            log DEBUG "Validating $egress_count egress rules..."
+            
+            local idx=0
+            while [[ $idx -lt $egress_count ]]; do
+                local port=$(jq -r ".egress[$idx].port" "$policy_file" 2>/dev/null)
+                local protocol=$(jq -r ".egress[$idx].protocol" "$policy_file" 2>/dev/null)
+                local action=$(jq -r ".egress[$idx].action" "$policy_file" 2>/dev/null)
+                
+                if ! validate_port "$port"; then
+                    log ERROR "Invalid port in egress rule $idx: $port"
+                    return 1
+                fi
+                
+                if ! validate_protocol "$protocol"; then
+                    log ERROR "Invalid protocol in egress rule $idx: $protocol"
+                    return 1
+                fi
+                
+                if [[ "$action" != "allow" && "$action" != "deny" ]]; then
+                    log ERROR "Invalid action in egress rule $idx: $action"
+                    return 1
+                fi
+                
+                ((idx++))
+            done
+            log DEBUG "All egress rules validated successfully"
+        fi
+    else
+        log WARN "jq not available, skipping detailed policy validation"
+        if ! python3 -c "import json; json.load(open('$policy_file'))" 2>/dev/null; then
+            log ERROR "Invalid JSON syntax (python3 check)"
+            return 1
+        fi
+    fi
+    
+    log DEBUG "Policy file validation passed"
+    return 0
+}
+
+create_vpc() {
+    check_root
+    
+    local start_time=$SECONDS
+    
+    if [[ $# -lt 2 ]]; then
+        log ERROR "Usage: vpcctl create-vpc <vpc-name> <cidr>"
+        log ERROR "Example: vpcctl create-vpc myvpc 10.0.0.0/16"
+        exit 1
+    fi
+    
+    local vpc_name=$1
+    local cidr=$2
+    
+    log INFO "Creating VPC: $vpc_name with CIDR: $cidr"
+    
+    if vpc_exists "$vpc_name"; then
+        log ERROR "VPC '$vpc_name' already exists"
+        exit 1
+    fi
+    
+    if [[ ! $cidr =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+        log ERROR "Invalid CIDR format: $cidr"
+        log ERROR "Expected format: X.X.X.X/Y (e.g., 10.0.0.0/16)"
+        exit 1
+    fi
+    
+    local bridge_name="${vpc_name}-br"
+    
+    if ip link show "$bridge_name" &> /dev/null; then
+        log WARN "Bridge '$bridge_name' already exists (cleaning up from previous failed run)"
+        ip link set "$bridge_name" down 2>/dev/null || true
+        ip link delete "$bridge_name" 2>/dev/null || true
+        log DEBUG "Cleaned up existing bridge"
+    fi
+    
+    log DEBUG "Creating bridge: $bridge_name"
+    ip link add "$bridge_name" type bridge
+    ip link set "$bridge_name" up
+    
+    local network_prefix=$(echo "$cidr" | cut -d'/' -f1 | cut -d'.' -f1-3)
+    local bridge_ip="${network_prefix}.1/$(echo $cidr | cut -d'/' -f2)"
+    
+    ip addr add "$bridge_ip" dev "$bridge_name"
+    
+    sysctl -w net.ipv4.ip_forward=1 > /dev/null
+    
+    echo "VPC:$vpc_name:$cidr:$bridge_name" >> "$STATE_FILE"
+    
+    local elapsed=$((SECONDS - start_time))
+    
+    log SUCCESS "VPC '$vpc_name' created successfully"
+    log INFO "  CIDR: $cidr"
+    log INFO "  Bridge: $bridge_name"
+    log INFO "  Bridge IP: $bridge_ip"
+    log SUCCESS "Operation completed in ${elapsed}s"
+}
+
+delete_vpc() {
+    check_root
+    
+    local start_time=$SECONDS
+    
+    if [[ $# -lt 1 ]]; then
+        log ERROR "Usage: vpcctl delete-vpc <vpc-name>"
+        exit 1
+    fi
+    
+    local vpc_name=$1
+    
+    log INFO "Deleting VPC: $vpc_name"
+    
+    if ! vpc_exists "$vpc_name"; then
+        log ERROR "VPC '$vpc_name' does not exist"
+        exit 1
+    fi
+    
+    local bridge_name=$(grep "^VPC:$vpc_name:" "$STATE_FILE" | cut -d':' -f4)
+    
+    while read -r line; do
+        if [[ $line == SUBNET:$vpc_name:* ]]; then
+            local subnet_name=$(echo "$line" | cut -d':' -f3)
+            log DEBUG "Deleting subnet: $subnet_name"
+            delete_subnet_internal "$vpc_name" "$subnet_name"
+        fi
+    done < "$STATE_FILE"
+    
+    if ip link show "$bridge_name" &> /dev/null; then
+        log DEBUG "Deleting bridge: $bridge_name"
+        ip link set "$bridge_name" down 2>/dev/null || true
+        ip link delete "$bridge_name" 2>/dev/null || true
+    fi
+    
+    sed -i "/^VPC:$vpc_name:/d" "$STATE_FILE"
+    sed -i "/^SUBNET:$vpc_name:/d" "$STATE_FILE"
+    sed -i "/^PEERING:.*:$vpc_name/d" "$STATE_FILE"
+    sed -i "/^PEERING:$vpc_name:/d" "$STATE_FILE"
+    
+    local elapsed=$((SECONDS - start_time))
+    
+    log SUCCESS "VPC '$vpc_name' deleted successfully"
+    log SUCCESS "Operation completed in ${elapsed}s"
+}
+
+list_vpcs() {
+    log INFO "Listing all VPCs"
+    echo ""
+    echo "═══════════════════════════════════════════════════"
+    echo "  VPCs"
+    echo "═══════════════════════════════════════════════════"
+    
+    if [[ ! -s "$STATE_FILE" ]]; then
+        echo "  No VPCs found"
+        echo ""
+        return
+    fi
+    
+    local found=false
+    while read -r line; do
+        if [[ $line == VPC:* ]]; then
+            found=true
+            local vpc_name=$(echo "$line" | cut -d':' -f2)
+            local cidr=$(echo "$line" | cut -d':' -f3)
+            local bridge=$(echo "$line" | cut -d':' -f4)
+            
+            echo ""
+            echo -e "  ${CYAN}VPC Name:${NC} $vpc_name"
+            echo -e "  ${BLUE}CIDR:${NC} $cidr"
+            echo -e "  ${BLUE}Bridge:${NC} $bridge"
+            
+            local subnet_count=$(grep -c "^SUBNET:$vpc_name:" "$STATE_FILE" 2>/dev/null || echo "0")
+            echo -e "  ${BLUE}Subnets:${NC} $subnet_count"
+            echo "  ─────────────────────────────────────────────────"
+        fi
+    done < "$STATE_FILE"
+    
+    if [[ $found == false ]]; then
+        echo "  No VPCs found"
+    fi
+    echo ""
+}
+
+create_subnet() {
+    check_root
+    
+    local start_time=$SECONDS
+    
+    if [[ $# -lt 4 ]]; then
+        log ERROR "Usage: vpcctl create-subnet <vpc-name> <subnet-name> <cidr> <type>"
+        log ERROR "Example: vpcctl create-subnet myvpc public-subnet 10.0.1.0/24 public"
+        log ERROR "Type must be: public or private"
+        exit 1
+    fi
+    
+    local vpc_name=$1
+    local subnet_name=$2
+    local cidr=$3
+    local subnet_type=$4
+    
+    log INFO "Creating subnet: $subnet_name in VPC: $vpc_name"
+   
+    if ! vpc_exists "$vpc_name"; then
+        log ERROR "VPC '$vpc_name' does not exist"
+        log ERROR "Create the VPC first with: sudo ./bin/vpcctl create-vpc $vpc_name <cidr>"
+        exit 1
+    fi
+    
+    if subnet_exists "$vpc_name" "$subnet_name"; then
+        log ERROR "Subnet '$subnet_name' already exists in VPC '$vpc_name'"
+        exit 1
+    fi
+    
+    if [[ "$subnet_type" != "public" && "$subnet_type" != "private" ]]; then
+        log ERROR "Subnet type must be 'public' or 'private'"
+        exit 1
+    fi
+    
+    local bridge_name=$(grep "^VPC:$vpc_name:" "$STATE_FILE" | cut -d':' -f4)
+    
+    local ns_name="${vpc_name}-${subnet_name}"
+    
+    if ip netns list | grep -q "^${ns_name}"; then
+        log WARN "Namespace '$ns_name' already exists (cleaning up from previous failed run)"
+        ip netns delete "$ns_name" 2>/dev/null || true
+        log DEBUG "Cleaned up existing namespace"
+    fi
+    
+    log DEBUG "Creating network namespace: $ns_name"
+    ip netns add "$ns_name"
+    
+    local veth_host="${ns_name}-h"
+    local veth_ns="${ns_name}-ns"
+    
+    if ip link show "$veth_host" &> /dev/null; then
+        log WARN "Veth pair already exists (cleaning up from previous failed run)"
+        ip link delete "$veth_host" 2>/dev/null || true
+        log DEBUG "Cleaned up existing veth pair"
+    fi
+    
+    log DEBUG "Creating veth pair: $veth_host <-> $veth_ns"
+    ip link add "$veth_host" type veth peer name "$veth_ns"
+    
+    ip link set "$veth_ns" netns "$ns_name"
+    
+    ip link set "$veth_host" master "$bridge_name"
+    ip link set "$veth_host" up
+    
+    local subnet_ip=$(echo "$cidr" | cut -d'/' -f1 | sed 's/\.0$/\.10/')
+    local subnet_mask=$(echo "$cidr" | cut -d'/' -f2)
+    
+    ip netns exec "$ns_name" ip link set lo up
+    ip netns exec "$ns_name" ip link set "$veth_ns" up
+    ip netns exec "$ns_name" ip addr add "${subnet_ip}/${subnet_mask}" dev "$veth_ns"
+    
+    local bridge_ip=$(ip addr show "$bridge_name" | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
+    
+    if [[ -n "$bridge_ip" ]]; then
+        ip netns exec "$ns_name" ip route add "$bridge_ip" dev "$veth_ns" 2>/dev/null || true
+        log DEBUG "Route to bridge ($bridge_ip) configured for namespace"
+    fi
+    
+    if [[ "$subnet_type" == "public" ]]; then
+        log DEBUG "Configuring NAT for public subnet"
+        
+        local host_iface=$(ip route | grep default | awk '{print $5}' | head -1)
+        
+        if [[ -z "$host_iface" ]]; then
+            log WARN "Could not detect default network interface"
+            host_iface="eth0"
+        fi
+        
+        iptables -t nat -A POSTROUTING -s "$cidr" -o "$host_iface" -j MASQUERADE
+        
+        iptables -A FORWARD -i "$bridge_name" -o "$host_iface" -j ACCEPT
+        iptables -A FORWARD -i "$host_iface" -o "$bridge_name" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    fi
+    
+    echo "SUBNET:$vpc_name:$subnet_name:$cidr:$subnet_type:$ns_name:$veth_host:$veth_ns:$subnet_ip" >> "$STATE_FILE"
+    
+    local elapsed=$((SECONDS - start_time))
+    
+    log SUCCESS "Subnet '$subnet_name' created successfully"
+    log INFO "  Type: $subnet_type"
+    log INFO "  CIDR: $cidr"
+    log INFO "  Namespace: $ns_name"
+    log INFO "  IP: $subnet_ip/$subnet_mask"
+    log SUCCESS "Operation completed in ${elapsed}s"
+}
+
+delete_subnet_internal() {
+    local vpc_name=$1
+    local subnet_name=$2
+    
+    local subnet_line=$(grep "^SUBNET:$vpc_name:$subnet_name:" "$STATE_FILE" 2>/dev/null || echo "")
+    
+    if [[ -z "$subnet_line" ]]; then
+        return
+    fi
+    
+    local ns_name=$(echo "$subnet_line" | cut -d':' -f6)
+    local veth_host=$(echo "$subnet_line" | cut -d':' -f7)
+    local cidr=$(echo "$subnet_line" | cut -d':' -f4)
+    local subnet_type=$(echo "$subnet_line" | cut -d':' -f5)
+    
+    if [[ "$subnet_type" == "public" ]]; then
+        local host_iface=$(ip route | grep default | awk '{print $5}' | head -1)
+        iptables -t nat -D POSTROUTING -s "$cidr" -o "$host_iface" -j MASQUERADE 2>/dev/null || true
+    fi
+    
+    if ip link show "$veth_host" &> /dev/null; then
+        ip link delete "$veth_host" 2>/dev/null || true
+    fi
+    
+    if ip netns list | grep -q "^${ns_name}"; then
+        ip netns delete "$ns_name" 2>/dev/null || true
+    fi
+    
+    sed -i "/^SUBNET:$vpc_name:$subnet_name:/d" "$STATE_FILE"
+}
+
+delete_subnet() {
+    check_root
+    
+    local start_time=$SECONDS
+    
+    if [[ $# -lt 2 ]]; then
+        log ERROR "Usage: vpcctl delete-subnet <vpc-name> <subnet-name>"
+        exit 1
+    fi
+    
+    local vpc_name=$1
+    local subnet_name=$2
+    
+    log INFO "Deleting subnet: $subnet_name from VPC: $vpc_name"
+    
+    if ! subnet_exists "$vpc_name" "$subnet_name"; then
+        log ERROR "Subnet '$subnet_name' does not exist in VPC '$vpc_name'"
+        exit 1
+    fi
+    
+    delete_subnet_internal "$vpc_name" "$subnet_name"
+    
+    local elapsed=$((SECONDS - start_time))
+    
+    log SUCCESS "Subnet '$subnet_name' deleted successfully"
+    log SUCCESS "Operation completed in ${elapsed}s"
+}
+
+list_subnets() {
+    if [[ $# -lt 1 ]]; then
+        log ERROR "Usage: vpcctl list-subnets <vpc-name>"
+        exit 1
+    fi
+    
+    local vpc_name=$1
+    
+    log INFO "Listing subnets in VPC: $vpc_name"
+    echo ""
+    echo "═══════════════════════════════════════════════════"
+    echo "  Subnets in VPC: $vpc_name"
+    echo "═══════════════════════════════════════════════════"
+    
+    if ! vpc_exists "$vpc_name"; then
+        echo "  VPC '$vpc_name' does not exist"
+        echo ""
+        return
+    fi
+    
+    local found=false
+    while read -r line; do
+        if [[ $line == SUBNET:$vpc_name:* ]]; then
+            found=true
+            local subnet_name=$(echo "$line" | cut -d':' -f3)
+            local cidr=$(echo "$line" | cut -d':' -f4)
+            local subnet_type=$(echo "$line" | cut -d':' -f5)
+            local subnet_ip=$(echo "$line" | cut -d':' -f9)
+            
+            echo ""
+            echo -e "  ${CYAN}Subnet Name:${NC} $subnet_name"
+            echo -e "  ${BLUE}Type:${NC} $subnet_type"
+            echo -e "  ${BLUE}CIDR:${NC} $cidr"
+            echo -e "  ${BLUE}IP:${NC} $subnet_ip"
+            echo "  ─────────────────────────────────────────────────"
+        fi
+    done < "$STATE_FILE"
+    
+    if [[ $found == false ]]; then
+        echo "  No subnets found in VPC '$vpc_name'"
+    fi
+    echo ""
+}
+
+deploy_webserver() {
+    check_root
+    
+    local start_time=$SECONDS
+    
+    if [[ $# -lt 2 ]]; then
+        log ERROR "Usage: vpcctl deploy-webserver <vpc-name> <subnet-name>"
+        exit 1
+    fi
+    
+    local vpc_name=$1
+    local subnet_name=$2
+    
+    log INFO "Deploying web server in subnet: $subnet_name"
+    
+    if ! subnet_exists "$vpc_name" "$subnet_name"; then
+        log ERROR "Subnet '$subnet_name' does not exist in VPC '$vpc_name'"
+        exit 1
+    fi
+    
+    local ns_name="${vpc_name}-${subnet_name}"
+    local subnet_ip=$(grep "^SUBNET:$vpc_name:$subnet_name:" "$STATE_FILE" | cut -d':' -f9)
+    
+    log DEBUG "Starting Python HTTP server in namespace"
+    
+    local html_content="<!DOCTYPE html>
+<html>
+<head>
+    <title>VPC Test Server</title>
+    <style>
+        body { font-family: Arial; margin: 40px; background: #f0f0f0; }
+        .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; }
+        .info { background: #3498db; color: white; padding: 15px; border-radius: 5px; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <div class='container'>
+        <h1>✓ Web Server Running</h1>
+        <div class='info'>
+            <strong>Subnet:</strong> $subnet_name<br>
+            <strong>VPC:</strong> $vpc_name<br>
+            <strong>IP:</strong> $subnet_ip
+        </div>
+        <p>This server is running inside a network namespace, simulating a subnet in a Virtual Private Cloud.</p>
+    </div>
+</body>
+</html>"
+    
+    ip netns exec "$ns_name" bash -c "echo '$html_content' > /tmp/index.html && cd /tmp && nohup python3 -m http.server 80 &> /tmp/webserver.log &"
+    
+    sleep 2
+    
+    local elapsed=$((SECONDS - start_time))
+    
+    log SUCCESS "Web server deployed in $subnet_name"
+    log INFO "  Access from host: curl http://$subnet_ip"
+    log INFO "  Access from browser: http://$subnet_ip"
+    log INFO "  Test in namespace: sudo ip netns exec $ns_name curl localhost"
+    log SUCCESS "Operation completed in ${elapsed}s"
+}
+
+test_connectivity() {
+    check_root
+    
+    local start_time=$SECONDS
+    
+    if [[ $# -lt 1 ]]; then
+        log ERROR "Usage: vpcctl test-connectivity <vpc-name>"
+        exit 1
+    fi
+    
+    local vpc_name=$1
+    
+    log INFO "Testing connectivity in VPC: $vpc_name"
+    echo ""
+    echo "═══════════════════════════════════════════════════"
+    echo "  Connectivity Tests for VPC: $vpc_name"
+    echo "═══════════════════════════════════════════════════"
+    echo ""
+    
+    if ! vpc_exists "$vpc_name"; then
+        echo "  VPC '$vpc_name' does not exist"
+        echo ""
+        return 1
+    fi
+    
+    local has_subnets=false
+    while read -r line; do
+        if [[ $line == SUBNET:$vpc_name:* ]]; then
+            has_subnets=true
+            local subnet_name=$(echo "$line" | cut -d':' -f3)
+            local ns_name=$(echo "$line" | cut -d':' -f6)
+            local subnet_ip=$(echo "$line" | cut -d':' -f9)
+            local subnet_type=$(echo "$line" | cut -d':' -f5)
+            
+            echo -e "${CYAN}Testing: $subnet_name ($subnet_type)${NC}"
+            
+            if ip netns exec "$ns_name" ip addr show lo | grep -q "UP"; then
+                echo -e "  ${GREEN}✓${NC} Loopback: OK (interface up)"
+            else
+                echo -e "  ${RED}✗${NC} Loopback: FAIL"
+            fi
+            
+            local bridge_name=$(grep "^VPC:$vpc_name:" "$STATE_FILE" | cut -d':' -f4)
+            local bridge_ip=$(ip addr show "$bridge_name" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
+            
+            if [[ -n "$bridge_ip" ]]; then
+                if ip netns exec "$ns_name" ip route | grep -q "$bridge_ip"; then
+                    echo -e "  ${GREEN}✓${NC} Bridge: OK (route to $bridge_ip exists)"
+                else
+                    echo -e "  ${YELLOW}⚠${NC} Bridge: Route not found (may work anyway)"
+                fi
+            fi
+            
+            if [[ "$subnet_type" == "public" ]]; then
+                if ip netns exec "$ns_name" ping -c 1 -W 2 8.8.8.8 &> /dev/null; then
+                    echo -e "  ${GREEN}✓${NC} Internet: OK (can reach 8.8.8.8)"
+                else
+                    echo -e "  ${YELLOW}⚠${NC} Internet: FAIL (NAT may not be working or no internet)"
+                fi
+            else
+                echo -e "  ${BLUE}ℹ${NC} Internet: Skipped (private subnet - no NAT configured)"
+            fi
+            
+            echo ""
+        fi
+    done < "$STATE_FILE"
+    
+    if [[ $has_subnets == false ]]; then
+        echo "  No subnets found in VPC '$vpc_name'"
+        echo ""
+    fi
+    
+    local elapsed=$((SECONDS - start_time))
+    log SUCCESS "Connectivity tests completed in ${elapsed}s"
+}
+
+peer_vpcs() {
+    check_root
+    
+    local start_time=$SECONDS
+    
+    if [[ $# -lt 2 ]]; then
+        log ERROR "Usage: vpcctl peer-vpcs <vpc1-name> <vpc2-name>"
+        exit 1
+    fi
+    
+    local vpc1=$1
+    local vpc2=$2
+    
+    log INFO "Creating peering between VPC: $vpc1 and VPC: $vpc2"
+    
+    if ! vpc_exists "$vpc1"; then
+        log ERROR "VPC '$vpc1' does not exist"
+        exit 1
+    fi
+    
+    if ! vpc_exists "$vpc2"; then
+        log ERROR "VPC '$vpc2' does not exist"
+        exit 1
+    fi
+    
+    if grep -q "^PEERING:$vpc1:$vpc2" "$STATE_FILE" 2>/dev/null || grep -q "^PEERING:$vpc2:$vpc1" "$STATE_FILE" 2>/dev/null; then
+        log ERROR "VPCs are already peered"
+        exit 1
+    fi
+    
+    local bridge1=$(grep "^VPC:$vpc1:" "$STATE_FILE" | cut -d':' -f4)
+    local bridge2=$(grep "^VPC:$vpc2:" "$STATE_FILE" | cut -d':' -f4)
+    local cidr1=$(grep "^VPC:$vpc1:" "$STATE_FILE" | cut -d':' -f3)
+    local cidr2=$(grep "^VPC:$vpc2:" "$STATE_FILE" | cut -d':' -f3)
+    
+    local veth1="p-${vpc1:0:5}-${vpc2:0:5}"
+    local veth2="p-${vpc2:0:5}-${vpc1:0:5}"
+    
+    if ip link show "$veth1" &> /dev/null; then
+        log WARN "Peering veth pair already exists (cleaning up from previous failed run)"
+        ip link delete "$veth1" 2>/dev/null || true
+        log DEBUG "Cleaned up existing peering veth pair"
+    fi
+    
+    log DEBUG "Creating peering veth pair: $veth1 <-> $veth2"
+    ip link add "$veth1" type veth peer name "$veth2"
+    
+    ip link set "$veth1" master "$bridge1"
+    ip link set "$veth2" master "$bridge2"
+    ip link set "$veth1" up
+    ip link set "$veth2" up
+    
+    ip route add "$cidr2" dev "$bridge1" 2>/dev/null || true
+    ip route add "$cidr1" dev "$bridge2" 2>/dev/null || true
+    
+    echo "PEERING:$vpc1:$vpc2:$veth1:$veth2" >> "$STATE_FILE"
+    
+    local elapsed=$((SECONDS - start_time))
+    
+    log SUCCESS "VPCs peered successfully"
+    log INFO "  $vpc1 ($cidr1) <-> $vpc2 ($cidr2)"
+    log SUCCESS "Operation completed in ${elapsed}s"
+}
+
+unpeer_vpcs() {
+    check_root
+    
+    local start_time=$SECONDS
+    
+    if [[ $# -lt 2 ]]; then
+        log ERROR "Usage: vpcctl unpeer-vpcs <vpc1-name> <vpc2-name>"
+        exit 1
+    fi
+    
+    local vpc1=$1
+    local vpc2=$2
+    
+    log INFO "Removing peering between VPC: $vpc1 and VPC: $vpc2"
+    
+    local peering_line=$(grep "^PEERING:$vpc1:$vpc2" "$STATE_FILE" 2>/dev/null || grep "^PEERING:$vpc2:$vpc1" "$STATE_FILE" 2>/dev/null || echo "")
+    
+    if [[ -z "$peering_line" ]]; then
+        log ERROR "No peering exists between these VPCs"
+        exit 1
+    fi
+    
+    local veth1=$(echo "$peering_line" | cut -d':' -f4)
+    
+    if ip link show "$veth1" &> /dev/null; then
+        ip link delete "$veth1" 2>/dev/null || true
+    fi
+    
+    local cidr1=$(grep "^VPC:$vpc1:" "$STATE_FILE" | cut -d':' -f3)
+    local cidr2=$(grep "^VPC:$vpc2:" "$STATE_FILE" | cut -d':' -f3)
+    local bridge1=$(grep "^VPC:$vpc1:" "$STATE_FILE" | cut -d':' -f4)
+    local bridge2=$(grep "^VPC:$vpc2:" "$STATE_FILE" | cut -d':' -f4)
+    
+    ip route del "$cidr2" dev "$bridge1" 2>/dev/null || true
+    ip route del "$cidr1" dev "$bridge2" 2>/dev/null || true
+    
+    sed -i "/^PEERING:$vpc1:$vpc2:/d" "$STATE_FILE"
+    sed -i "/^PEERING:$vpc2:$vpc1:/d" "$STATE_FILE"
+    
+    local elapsed=$((SECONDS - start_time))
+    
+    log SUCCESS "Peering removed successfully"
+    log SUCCESS "Operation completed in ${elapsed}s"
+}
+
+apply_policy() {
+    check_root
+    
+    local start_time=$SECONDS
+    
+    if [[ $# -lt 3 ]]; then
+        log ERROR "Usage: vpcctl apply-policy <vpc-name> <subnet-name> <policy-file>"
+        log ERROR "Example: vpcctl apply-policy myvpc public configs/policy.json"
+        exit 1
+    fi
+    
+    local vpc_name=$1
+    local subnet_name=$2
+    local policy_file=$3
+    
+    log INFO "Applying firewall policy to subnet: $subnet_name"
+    
+    if ! subnet_exists "$vpc_name" "$subnet_name"; then
+        log ERROR "Subnet does not exist"
+        exit 1
+    fi
+    
+    if ! validate_policy_file "$policy_file"; then
+        log ERROR "Policy validation failed - not applying rules"
+        exit 1
+    fi
+    
+    local ns_name="${vpc_name}-${subnet_name}"
+    
+    if command -v jq &> /dev/null; then
+        log DEBUG "Using jq for JSON parsing"
+        apply_policy_with_jq "$ns_name" "$policy_file"
+    else
+        log WARN "jq not found, using basic parser (install jq for better parsing)"
+        apply_policy_basic "$ns_name" "$policy_file"
+    fi
+    
+    local elapsed=$((SECONDS - start_time))
+    
+    log SUCCESS "Firewall policy applied successfully"
+    log SUCCESS "Operation completed in ${elapsed}s"
+}
+
+apply_policy_with_jq() {
+    local ns_name=$1
+    local policy_file=$2
+    
+    local ingress_rules=$(jq -r '.ingress[]? | "\(.port):\(.protocol):\(.action)"' "$policy_file" 2>/dev/null)
+    
+    if [[ -z "$ingress_rules" ]]; then
+        log WARN "No valid ingress rules found in policy file"
+    else
+        log DEBUG "Applying ingress rules..."
+        while IFS=':' read -r port protocol action; do
+            if [[ -n "$port" && -n "$protocol" && -n "$action" ]]; then
+                if [[ "$action" == "allow" ]]; then
+                    log DEBUG "Allowing $protocol port $port"
+                    ip netns exec "$ns_name" iptables -A INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null || true
+                elif [[ "$action" == "deny" ]]; then
+                    log DEBUG "Denying $protocol port $port"
+                    ip netns exec "$ns_name" iptables -A INPUT -p "$protocol" --dport "$port" -j DROP 2>/dev/null || true
+                fi
+            fi
+        done <<< "$ingress_rules"
+    fi
+    
+    local egress_rules=$(jq -r '.egress[]? | "\(.port):\(.protocol):\(.action)"' "$policy_file" 2>/dev/null)
+    
+    if [[ -n "$egress_rules" ]]; then
+        log DEBUG "Applying egress rules..."
+        while IFS=':' read -r port protocol action; do
+            if [[ -n "$port" && -n "$protocol" && -n "$action" ]]; then
+                if [[ "$action" == "allow" ]]; then
+                    log DEBUG "Allowing outbound $protocol port $port"
+                    ip netns exec "$ns_name" iptables -A OUTPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null || true
+                elif [[ "$action" == "deny" ]]; then
+                    log DEBUG "Denying outbound $protocol port $port"
+                    ip netns exec "$ns_name" iptables -A OUTPUT -p "$protocol" --dport "$port" -j DROP 2>/dev/null || true
+                fi
+            fi
+        done <<< "$egress_rules"
+    fi
+}
+
+apply_policy_basic() {
+    local ns_name=$1
+    local policy_file=$2
+    
+    log DEBUG "Parsing policy file with basic parser: $policy_file"
+    
+    local port=""
+    local protocol=""
+    local action=""
+    
+    while IFS= read -r line; do
+        if [[ $line =~ \"port\"[[:space:]]*:[[:space:]]*([0-9]+) ]]; then
+            port="${BASH_REMATCH[1]}"
+        fi
+        
+        if [[ $line =~ \"protocol\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+            protocol="${BASH_REMATCH[1]}"
+        fi
+        
+        if [[ $line =~ \"action\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+            action="${BASH_REMATCH[1]}"
+            
+            if [[ -n "$port" && -n "$protocol" && -n "$action" ]]; then
+                if [[ "$action" == "allow" ]]; then
+                    log DEBUG "Allowing $protocol port $port"
+                    ip netns exec "$ns_name" iptables -A INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null || true
+                elif [[ "$action" == "deny" ]]; then
+                    log DEBUG "Denying $protocol port $port"
+                    ip netns exec "$ns_name" iptables -A INPUT -p "$protocol" --dport "$port" -j DROP 2>/dev/null || true
+                fi
+                
+                port=""
+                protocol=""
+                action=""
+            fi
+        fi
+    done < "$policy_file"
+}
+
+cleanup_all() {
+    check_root
+    
+    local start_time=$SECONDS
+    
+    log WARN "This will delete ALL VPCs and resources"
+    
+    if [[ -t 0 ]]; then
+        read -p "Are you sure? (y/N): " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            log INFO "Cleanup cancelled"
+            exit 0
+        fi
+    fi
+    
+    log INFO "Starting cleanup of all VPCs..."
+    
+    local vpcs=$(grep "^VPC:" "$STATE_FILE" 2>/dev/null | cut -d':' -f2 || echo "")
+    
+    if [[ -z "$vpcs" ]]; then
+        log INFO "No VPCs to clean up"
+        return
+    fi
+    
+    for vpc in $vpcs; do
+        log INFO "Deleting VPC: $vpc"
+        delete_vpc "$vpc" 2>/dev/null || true
+    done
+    
+    log DEBUG "Cleaning up any orphaned namespaces..."
+    for ns in $(ip netns list 2>/dev/null | awk '{print $1}'); do
+        ip netns delete "$ns" 2>/dev/null || true
+    done
+    
+    > "$STATE_FILE"
+    
+    log DEBUG "Flushing custom iptables rules..."
+    iptables -t nat -F POSTROUTING 2>/dev/null || true
+    iptables -F FORWARD 2>/dev/null || true
+    
+    local elapsed=$((SECONDS - start_time))
+    
+    log SUCCESS "All resources cleaned up successfully"
+    log SUCCESS "Operation completed in ${elapsed}s"
+}
+
+show_help() {
+    cat << EOF
+
+${CYAN}═══════════════════════════════════════════════════════════════${NC}
+  ${GREEN}vpcctl${NC} - Virtual Private Cloud Control Tool
+  Stage 4: HNG DevOps Internship Task
+${CYAN}═══════════════════════════════════════════════════════════════${NC}
+
+${YELLOW}Usage:${NC} vpcctl <command> [options]
+
+${YELLOW}VPC Management:${NC}
+  create-vpc <name> <cidr>              Create a new VPC
+  delete-vpc <name>                     Delete a VPC
+  list-vpcs                             List all VPCs
+
+${YELLOW}Subnet Management:${NC}
+  create-subnet <vpc> <name> <cidr> <type>
+                                        Create subnet (type: public|private)
+  delete-subnet <vpc> <subnet>          Delete a subnet
+  list-subnets <vpc>                    List subnets in a VPC
+
+${YELLOW}Deployment & Testing:${NC}
+  deploy-webserver <vpc> <subnet>       Deploy test web server in subnet
+  test-connectivity <vpc>               Test VPC connectivity
+
+${YELLOW}VPC Peering:${NC}
+  peer-vpcs <vpc1> <vpc2>               Connect two VPCs
+  unpeer-vpcs <vpc1> <vpc2>             Disconnect VPC peering
+
+${YELLOW}Security:${NC}
+  apply-policy <vpc> <subnet> <file>    Apply firewall rules from JSON file
+
+${YELLOW}Cleanup:${NC}
+  cleanup-all                           Remove all VPCs and resources
+
+${YELLOW}Examples:${NC}
+  ${GREEN}# Create a VPC${NC}
+  sudo ./bin/vpcctl create-vpc myvpc 10.0.0.0/16
+
+  ${GREEN}# Create public and private subnets${NC}
+  sudo ./bin/vpcctl create-subnet myvpc public 10.0.1.0/24 public
+  sudo ./bin/vpcctl create-subnet myvpc private 10.0.2.0/24 private
+
+  ${GREEN}# Deploy web server${NC}
+  sudo ./bin/vpcctl deploy-webserver myvpc public
+
+  ${GREEN}# Test connectivity${NC}
+  sudo ./bin/vpcctl test-connectivity myvpc
+
+  ${GREEN}# Create second VPC and peer${NC}
+  sudo ./bin/vpcctl create-vpc vpc2 172.16.0.0/16
+  sudo ./bin/vpcctl peer-vpcs myvpc vpc2
+
+  ${GREEN}# Apply firewall policy${NC}
+  sudo ./bin/vpcctl apply-policy myvpc public configs/policy.json
+
+  ${GREEN}# Clean up everything${NC}
+  sudo ./bin/vpcctl cleanup-all
+
+${CYAN}═══════════════════════════════════════════════════════════════${NC}
+
+${YELLOW}Documentation:${NC}
+  - README.md for detailed usage
+  - configs/example-policies/ for policy examples
+  - logs/vpcctl.log for operation logs
+
+${YELLOW}Variables:${NC}
+  VPC_NAME           - Unique VPC identifier
+  CIDR_BLOCK         - IP range (e.g., 10.0.0.0/16)
+  PUBLIC_SUBNET      - Subnet with NAT (internet access)
+  PRIVATE_SUBNET     - Internal-only subnet
+  INTERNET_INTERFACE - Auto-detected from default route
+
+${CYAN}═══════════════════════════════════════════════════════════════${NC}
+
+EOF
+}
+
+main() {
+    init
+    check_dependencies
+    
+    if [[ $# -eq 0 ]]; then
+        show_help
+        exit 0
+    fi
+    
+    local command=$1
+    shift
+    
+    case $command in
+        create-vpc)         create_vpc "$@" ;;
+        delete-vpc)         delete_vpc "$@" ;;
+        list-vpcs)          list_vpcs ;;
+        create-subnet)      create_subnet "$@" ;;
+        delete-subnet)      delete_subnet "$@" ;;
+        list-subnets)       list_subnets "$@" ;;
+        deploy-webserver)   deploy_webserver "$@" ;;
+        test-connectivity)  test_connectivity "$@" ;;
+        peer-vpcs)          peer_vpcs "$@" ;;
+        unpeer-vpcs)        unpeer_vpcs "$@" ;;
+        apply-policy)       apply_policy "$@" ;;
+        cleanup-all)        cleanup_all ;;
+        help|--help|-h)     show_help ;;
+        *)
+            log ERROR "Unknown command: $command"
+            echo ""
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
