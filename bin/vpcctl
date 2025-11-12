@@ -418,9 +418,17 @@ create_subnet() {
     local subnet_ip=$(echo "$cidr" | cut -d'/' -f1 | sed 's/\.0$/\.10/')
     local subnet_mask=$(echo "$cidr" | cut -d'/' -f2)
     
+   # Configure namespace loopback
     ip netns exec "$ns_name" ip link set lo up
+    
+    # Bring up the veth interface in namespace
     ip netns exec "$ns_name" ip link set "$veth_ns" up
+    
+    # Assign IP address to namespace interface
     ip netns exec "$ns_name" ip addr add "${subnet_ip}/${subnet_mask}" dev "$veth_ns"
+    
+    # Wait a moment for interface to be fully up
+    sleep 0.5
     
     # Get bridge IP for gateway
     local bridge_ip=$(ip addr show "$bridge_name" | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
@@ -428,13 +436,29 @@ create_subnet() {
     if [[ -z "$bridge_ip" ]]; then
         log ERROR "Could not detect bridge IP address"
         # Cleanup on failure
+        ip link delete "$veth_host" 2>/dev/null || true
         ip netns delete "$ns_name" 2>/dev/null || true
         exit 1
     fi
     
-    # Set default gateway
-    log DEBUG "Setting default gateway to $bridge_ip"
-    ip netns exec "$ns_name" ip route add default via "$bridge_ip" dev "$veth_ns"
+    log DEBUG "Bridge IP detected: $bridge_ip"
+    
+    # Verify the interface is up before adding route
+    if ! ip netns exec "$ns_name" ip link show "$veth_ns" | grep -q "UP"; then
+        log ERROR "Interface $veth_ns failed to come up"
+        ip link delete "$veth_host" 2>/dev/null || true
+        ip netns delete "$ns_name" 2>/dev/null || true
+        exit 1
+    fi
+    
+    # Set default gateway (now interface is guaranteed to be up)
+    log DEBUG "Setting default gateway to $bridge_ip via $veth_ns"
+    if ! ip netns exec "$ns_name" ip route add default via "$bridge_ip" dev "$veth_ns" 2>&1; then
+        log ERROR "Failed to set default gateway"
+        log DEBUG "Attempting alternative gateway configuration..."
+        # Alternative: Try without specifying dev
+        ip netns exec "$ns_name" ip route add default via "$bridge_ip" 2>/dev/null || true
+    fi
     
     # Configure DNS for namespace
     ip netns exec "$ns_name" mkdir -p /etc/netns 2>/dev/null || true
