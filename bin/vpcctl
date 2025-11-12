@@ -418,14 +418,23 @@ create_subnet() {
     local subnet_ip=$(echo "$cidr" | cut -d'/' -f1 | sed 's/\.0$/\.10/')
     local subnet_mask=$(echo "$cidr" | cut -d'/' -f2)
     
+    # CRITICAL FIX: Get VPC CIDR to determine proper subnet mask
+    local vpc_cidr=$(grep "^VPC:$vpc_name:" "$STATE_FILE" | cut -d':' -f3)
+    local vpc_mask=$(echo "$vpc_cidr" | cut -d'/' -f2)
+    
+    log DEBUG "Subnet CIDR: $cidr (advertised as /${subnet_mask})"
+    log DEBUG "VPC CIDR: $vpc_cidr (actual mask: /${vpc_mask})"
+    
     # Configure namespace loopback
     ip netns exec "$ns_name" ip link set lo up
     
     # Bring up the veth interface in namespace
     ip netns exec "$ns_name" ip link set "$veth_ns" up
     
-    # Assign IP address to namespace interface
-    ip netns exec "$ns_name" ip addr add "${subnet_ip}/${subnet_mask}" dev "$veth_ns"
+    # CRITICAL FIX: Use VPC mask for namespace IP so it can reach the bridge
+    # This allows 10.0.1.10/16 to see 10.0.0.1 as local (not 10.0.1.10/24)
+    log DEBUG "Assigning IP: ${subnet_ip}/${vpc_mask} (using VPC mask for proper routing)"
+    ip netns exec "$ns_name" ip addr add "${subnet_ip}/${vpc_mask}" dev "$veth_ns"
     
     # Get bridge IP for gateway
     local bridge_ip=$(ip addr show "$bridge_name" | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
@@ -463,45 +472,24 @@ create_subnet() {
     # Additional wait to ensure full network stack initialization
     sleep 0.3
     
-    # Set default gateway with multiple attempts
+    # Set default gateway - now this should work since we're using VPC mask
     log DEBUG "Setting default gateway to $bridge_ip"
-    local gateway_set=false
     
-    # Method 1: Try with explicit device
     if ip netns exec "$ns_name" ip route add default via "$bridge_ip" dev "$veth_ns" 2>/dev/null; then
-        log DEBUG "Default gateway set successfully (method 1)"
-        gateway_set=true
-    else
-        log WARN "Method 1 failed, trying alternative..."
+        log DEBUG "Default gateway set successfully"
         
-        # Method 2: Try without explicit device
-        if ip netns exec "$ns_name" ip route add default via "$bridge_ip" 2>/dev/null; then
-            log DEBUG "Default gateway set successfully (method 2)"
-            gateway_set=true
-        else
-            log WARN "Method 2 failed, trying with explicit metric..."
-            
-            # Method 3: Try with metric
-            if ip netns exec "$ns_name" ip route add default via "$bridge_ip" metric 100 2>/dev/null; then
-                log DEBUG "Default gateway set successfully (method 3)"
-                gateway_set=true
-            fi
-        fi
-    fi
-    
-    if [[ "$gateway_set" == false ]]; then
-        log ERROR "Failed to set default gateway after all attempts"
-        log ERROR "This may be a WSL kernel limitation"
-        log DEBUG "Checking namespace configuration..."
-        ip netns exec "$ns_name" ip addr show
-        ip netns exec "$ns_name" ip route show
-    else
         # Verify the route was actually added
         if ip netns exec "$ns_name" ip route show | grep -q "default via $bridge_ip"; then
             log DEBUG "Default route verified in routing table"
         else
             log WARN "Default route not found in routing table despite successful command"
         fi
+    else
+        log ERROR "Failed to set default gateway"
+        log ERROR "Even with proper subnet mask, gateway setup failed"
+        log DEBUG "Checking namespace configuration..."
+        ip netns exec "$ns_name" ip addr show
+        ip netns exec "$ns_name" ip route show
     fi
     
     # Configure DNS for namespace
@@ -588,7 +576,7 @@ create_subnet() {
     log INFO "  Type: $subnet_type"
     log INFO "  CIDR: $cidr"
     log INFO "  Namespace: $ns_name"
-    log INFO "  IP: $subnet_ip/$subnet_mask"
+    log INFO "  IP: $subnet_ip/${vpc_mask} (using VPC mask for routing)"
     log INFO "  Gateway: $bridge_ip"
     if [[ "$subnet_type" == "public" ]]; then
         log INFO "  NAT: Enabled via $host_iface"
