@@ -81,7 +81,7 @@ print_step "Creating private subnet (10.0.2.0/24)..."
 sleep 1
 
 print_step "Listing subnets in production VPC..."
-./bin/vpcctl list-subnets production
+./bin/vpcctl list-subnets prod
 wait_for_user
 
 # ============================================================================
