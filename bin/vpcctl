@@ -418,7 +418,7 @@ create_subnet() {
     local subnet_ip=$(echo "$cidr" | cut -d'/' -f1 | sed 's/\.0$/\.10/')
     local subnet_mask=$(echo "$cidr" | cut -d'/' -f2)
     
-   # Configure namespace loopback
+    # Configure namespace loopback
     ip netns exec "$ns_name" ip link set lo up
     
     # Bring up the veth interface in namespace
@@ -427,14 +427,12 @@ create_subnet() {
     # Assign IP address to namespace interface
     ip netns exec "$ns_name" ip addr add "${subnet_ip}/${subnet_mask}" dev "$veth_ns"
     
-    # Wait a moment for interface to be fully up
-    sleep 0.5
-    
     # Get bridge IP for gateway
     local bridge_ip=$(ip addr show "$bridge_name" | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
     
     if [[ -z "$bridge_ip" ]]; then
         log ERROR "Could not detect bridge IP address"
+        log ERROR "Bridge $bridge_name may not be configured properly"
         # Cleanup on failure
         ip link delete "$veth_host" 2>/dev/null || true
         ip netns delete "$ns_name" 2>/dev/null || true
@@ -443,21 +441,67 @@ create_subnet() {
     
     log DEBUG "Bridge IP detected: $bridge_ip"
     
-    # Verify the interface is up before adding route
-    if ! ip netns exec "$ns_name" ip link show "$veth_ns" | grep -q "UP"; then
-        log ERROR "Interface $veth_ns failed to come up"
+    # Critical: Wait for interface to be fully operational
+    local retry_count=0
+    local max_retries=5
+    while [[ $retry_count -lt $max_retries ]]; do
+        if ip netns exec "$ns_name" ip link show "$veth_ns" 2>/dev/null | grep -q "state UP"; then
+            log DEBUG "Interface $veth_ns is UP and operational"
+            break
+        fi
+        sleep 0.2
+        ((retry_count++))
+    done
+    
+    if [[ $retry_count -eq $max_retries ]]; then
+        log ERROR "Interface $veth_ns failed to come up after $max_retries attempts"
         ip link delete "$veth_host" 2>/dev/null || true
         ip netns delete "$ns_name" 2>/dev/null || true
         exit 1
     fi
     
-    # Set default gateway (now interface is guaranteed to be up)
-    log DEBUG "Setting default gateway to $bridge_ip via $veth_ns"
-    if ! ip netns exec "$ns_name" ip route add default via "$bridge_ip" dev "$veth_ns" 2>&1; then
-        log ERROR "Failed to set default gateway"
-        log DEBUG "Attempting alternative gateway configuration..."
-        # Alternative: Try without specifying dev
-        ip netns exec "$ns_name" ip route add default via "$bridge_ip" 2>/dev/null || true
+    # Additional wait to ensure full network stack initialization
+    sleep 0.3
+    
+    # Set default gateway with multiple attempts
+    log DEBUG "Setting default gateway to $bridge_ip"
+    local gateway_set=false
+    
+    # Method 1: Try with explicit device
+    if ip netns exec "$ns_name" ip route add default via "$bridge_ip" dev "$veth_ns" 2>/dev/null; then
+        log DEBUG "Default gateway set successfully (method 1)"
+        gateway_set=true
+    else
+        log WARN "Method 1 failed, trying alternative..."
+        
+        # Method 2: Try without explicit device
+        if ip netns exec "$ns_name" ip route add default via "$bridge_ip" 2>/dev/null; then
+            log DEBUG "Default gateway set successfully (method 2)"
+            gateway_set=true
+        else
+            log WARN "Method 2 failed, trying with explicit metric..."
+            
+            # Method 3: Try with metric
+            if ip netns exec "$ns_name" ip route add default via "$bridge_ip" metric 100 2>/dev/null; then
+                log DEBUG "Default gateway set successfully (method 3)"
+                gateway_set=true
+            fi
+        fi
+    fi
+    
+    if [[ "$gateway_set" == false ]]; then
+        log ERROR "Failed to set default gateway after all attempts"
+        log ERROR "This may be a WSL kernel limitation"
+        log DEBUG "Checking namespace configuration..."
+        ip netns exec "$ns_name" ip addr show
+        ip netns exec "$ns_name" ip route show
+    else
+        # Verify the route was actually added
+        if ip netns exec "$ns_name" ip route show | grep -q "default via $bridge_ip"; then
+            log DEBUG "Default route verified in routing table"
+        else
+            log WARN "Default route not found in routing table despite successful command"
+        fi
     fi
     
     # Configure DNS for namespace
