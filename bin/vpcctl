@@ -62,6 +62,18 @@ check_dependencies() {
         exit 1
     fi
     
+    # WSL-specific: Check iptables mode
+    if grep -qi microsoft /proc/version; then
+        log DEBUG "WSL detected - checking iptables configuration"
+        
+        # Try to ensure we're using iptables-legacy
+        if command -v update-alternatives &> /dev/null; then
+            update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true
+            update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null || true
+            log DEBUG "Switched to iptables-legacy mode"
+        fi
+    fi
+    
     if ! command -v jq &> /dev/null; then
         log WARN "jq is not installed (optional but recommended for JSON parsing)"
         log INFO "Install with: sudo apt-get install jq (Ubuntu/Debian)"
@@ -212,6 +224,7 @@ create_vpc() {
     
     local bridge_name="${vpc_name}-br"
     
+    # Clean up any existing bridge
     if ip link show "$bridge_name" &> /dev/null; then
         log WARN "Bridge '$bridge_name' already exists (cleaning up from previous failed run)"
         ip link set "$bridge_name" down 2>/dev/null || true
@@ -223,13 +236,21 @@ create_vpc() {
     ip link add "$bridge_name" type bridge
     ip link set "$bridge_name" up
     
+    # Assign IP to bridge
     local network_prefix=$(echo "$cidr" | cut -d'/' -f1 | cut -d'.' -f1-3)
     local bridge_ip="${network_prefix}.1/$(echo $cidr | cut -d'/' -f2)"
     
     ip addr add "$bridge_ip" dev "$bridge_name"
     
+    # Enable IP forwarding (critical for routing)
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
+    sysctl -w net.ipv4.conf.all.forwarding=1 > /dev/null
+    sysctl -w net.ipv4.conf.default.forwarding=1 > /dev/null
+    sysctl -w net.ipv4.conf.${bridge_name}.forwarding=1 > /dev/null 2>&1 || true
     
+    log DEBUG "IP forwarding enabled for bridge and system"
+    
+    # Save VPC state
     echo "VPC:$vpc_name:$cidr:$bridge_name" >> "$STATE_FILE"
     
     local elapsed=$((SECONDS - start_time))
@@ -364,6 +385,7 @@ create_subnet() {
     
     local ns_name="${vpc_name}-${subnet_name}"
     
+    # Clean up any existing resources
     if ip netns list | grep -q "^${ns_name}"; then
         log WARN "Namespace '$ns_name' already exists (cleaning up from previous failed run)"
         ip netns delete "$ns_name" 2>/dev/null || true
@@ -385,11 +407,14 @@ create_subnet() {
     log DEBUG "Creating veth pair: $veth_host <-> $veth_ns"
     ip link add "$veth_host" type veth peer name "$veth_ns"
     
+    # Move one end to namespace
     ip link set "$veth_ns" netns "$ns_name"
     
+    # Connect host end to bridge
     ip link set "$veth_host" master "$bridge_name"
     ip link set "$veth_host" up
     
+    # Configure namespace interface
     local subnet_ip=$(echo "$cidr" | cut -d'/' -f1 | sed 's/\.0$/\.10/')
     local subnet_mask=$(echo "$cidr" | cut -d'/' -f2)
     
@@ -397,29 +422,96 @@ create_subnet() {
     ip netns exec "$ns_name" ip link set "$veth_ns" up
     ip netns exec "$ns_name" ip addr add "${subnet_ip}/${subnet_mask}" dev "$veth_ns"
     
+    # Get bridge IP for gateway
     local bridge_ip=$(ip addr show "$bridge_name" | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
     
-    if [[ -n "$bridge_ip" ]]; then
-        ip netns exec "$ns_name" ip route add "$bridge_ip" dev "$veth_ns" 2>/dev/null || true
-        log DEBUG "Route to bridge ($bridge_ip) configured for namespace"
+    if [[ -z "$bridge_ip" ]]; then
+        log ERROR "Could not detect bridge IP address"
+        # Cleanup on failure
+        ip netns delete "$ns_name" 2>/dev/null || true
+        exit 1
     fi
     
+    # Set default gateway
+    log DEBUG "Setting default gateway to $bridge_ip"
+    ip netns exec "$ns_name" ip route add default via "$bridge_ip" dev "$veth_ns"
+    
+    # Configure DNS for namespace
+    ip netns exec "$ns_name" mkdir -p /etc/netns 2>/dev/null || true
+    echo "nameserver 8.8.8.8" | ip netns exec "$ns_name" tee /etc/resolv.conf > /dev/null 2>&1 || true
+    echo "nameserver 8.8.4.4" | ip netns exec "$ns_name" tee -a /etc/resolv.conf > /dev/null 2>&1 || true
+    log DEBUG "DNS configured for namespace"
+    
+    # Configure NAT for public subnets
     if [[ "$subnet_type" == "public" ]]; then
-        log DEBUG "Configuring NAT for public subnet"
+        log DEBUG "Configuring NAT for public subnet (WSL-compatible)"
         
+        # Detect host network interface
         local host_iface=$(ip route | grep default | awk '{print $5}' | head -1)
         
         if [[ -z "$host_iface" ]]; then
-            log WARN "Could not detect default network interface"
-            host_iface="eth0"
+            log WARN "Could not auto-detect default interface, trying common names..."
+            for iface in eth0 ens33 enp0s3 wlan0; do
+                if ip link show "$iface" &> /dev/null 2>&1; then
+                    host_iface="$iface"
+                    log DEBUG "Found interface: $host_iface"
+                    break
+                fi
+            done
         fi
         
-        iptables -t nat -A POSTROUTING -s "$cidr" -o "$host_iface" -j MASQUERADE
+        if [[ -z "$host_iface" ]]; then
+            log ERROR "Could not detect any network interface for NAT"
+            log ERROR "Available interfaces:"
+            ip link show | grep -E "^[0-9]+:" | awk '{print "  - " $2}' | sed 's/:$//'
+            exit 1
+        fi
         
-        iptables -A FORWARD -i "$bridge_name" -o "$host_iface" -j ACCEPT
-        iptables -A FORWARD -i "$host_iface" -o "$bridge_name" -m state --state RELATED,ESTABLISHED -j ACCEPT
+        log DEBUG "Using network interface: $host_iface for NAT"
+        
+        # Enable IP forwarding for all relevant interfaces
+        sysctl -w net.ipv4.ip_forward=1 > /dev/null
+        sysctl -w net.ipv4.conf.all.forwarding=1 > /dev/null
+        sysctl -w net.ipv4.conf.default.forwarding=1 > /dev/null
+        sysctl -w net.ipv4.conf.${bridge_name}.forwarding=1 > /dev/null 2>&1 || true
+        sysctl -w net.ipv4.conf.${host_iface}.forwarding=1 > /dev/null 2>&1 || true
+        sysctl -w net.ipv4.conf.${veth_host}.forwarding=1 > /dev/null 2>&1 || true
+        log DEBUG "IP forwarding enabled for all interfaces"
+        
+        # Add NAT MASQUERADE rule (check if exists first)
+        if ! iptables -t nat -C POSTROUTING -s "$cidr" -o "$host_iface" -j MASQUERADE 2>/dev/null; then
+            iptables -t nat -A POSTROUTING -s "$cidr" -o "$host_iface" -j MASQUERADE
+            log DEBUG "NAT MASQUERADE rule added: $cidr -> $host_iface"
+        else
+            log DEBUG "NAT rule already exists for $cidr"
+        fi
+        
+        # Add FORWARD rules (bridge -> host)
+        if ! iptables -C FORWARD -i "$bridge_name" -o "$host_iface" -j ACCEPT 2>/dev/null; then
+            iptables -A FORWARD -i "$bridge_name" -o "$host_iface" -j ACCEPT
+            log DEBUG "FORWARD rule added: $bridge_name -> $host_iface"
+        fi
+        
+        # Add FORWARD rules (host -> bridge, established connections)
+        if ! iptables -C FORWARD -i "$host_iface" -o "$bridge_name" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
+            iptables -A FORWARD -i "$host_iface" -o "$bridge_name" -m state --state RELATED,ESTABLISHED -j ACCEPT
+            log DEBUG "FORWARD rule added: $host_iface -> $bridge_name (established)"
+        fi
+        
+        # WSL-specific: Allow bridge-to-bridge forwarding
+        if ! iptables -C FORWARD -i "$bridge_name" -o "$bridge_name" -j ACCEPT 2>/dev/null; then
+            iptables -A FORWARD -i "$bridge_name" -o "$bridge_name" -j ACCEPT
+            log DEBUG "FORWARD rule added: $bridge_name <-> $bridge_name"
+        fi
+        
+        # Additional WSL fix: Allow forwarding from veth to host
+        if ! iptables -C FORWARD -i "$veth_host" -o "$host_iface" -j ACCEPT 2>/dev/null; then
+            iptables -A FORWARD -i "$veth_host" -o "$host_iface" -j ACCEPT
+            log DEBUG "FORWARD rule added: $veth_host -> $host_iface"
+        fi
     fi
     
+    # Save subnet state
     echo "SUBNET:$vpc_name:$subnet_name:$cidr:$subnet_type:$ns_name:$veth_host:$veth_ns:$subnet_ip" >> "$STATE_FILE"
     
     local elapsed=$((SECONDS - start_time))
@@ -429,6 +521,10 @@ create_subnet() {
     log INFO "  CIDR: $cidr"
     log INFO "  Namespace: $ns_name"
     log INFO "  IP: $subnet_ip/$subnet_mask"
+    log INFO "  Gateway: $bridge_ip"
+    if [[ "$subnet_type" == "public" ]]; then
+        log INFO "  NAT: Enabled via $host_iface"
+    fi
     log SUCCESS "Operation completed in ${elapsed}s"
 }
 
