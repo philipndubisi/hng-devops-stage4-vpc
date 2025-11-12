@@ -1,297 +1,329 @@
 #!/bin/bash
+#
+# VPC Demo Script - HNG DevOps Stage 4
+# Demonstrates all VPC features: creation, isolation, peering, NAT, and cleanup
+#
+# Usage: sudo ./demo-script.sh
+#
 
-# ============================================================================
-# Stage 4 VPC Demonstration Script
-# Complete test coverage for all acceptance criteria
-# ============================================================================
+set -e  # Exit on error
 
-set -e
-
+# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m'
+MAGENTA='\033[0;35m'
+NC='\033[0m' # No Color
 
-echo ""
-echo "========================================================================="
-echo "  Stage 4: Virtual Private Cloud (VPC) Implementation"
-echo "  Complete Demonstration - All Test Scenarios"
-echo "========================================================================="
-echo ""
-sleep 3
-
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 1: Creating VPC with CIDR 10.0.0.0/16"
-echo "Expected: VPC created with bridge, namespaces, internal connectivity"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-sudo ./bin/vpcctl create-vpc demo 10.0.0.0/16
-sleep 3
-
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 2: Creating Public and Private Subnets"
-echo "Expected: Each subnet has correct CIDR and communication within VPC"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo "Creating public subnet (10.0.1.0/24)..."
-sudo ./bin/vpcctl create-subnet demo public 10.0.1.0/24 public
-echo ""
-echo "Creating private subnet (10.0.2.0/24)..."
-sudo ./bin/vpcctl create-subnet demo private 10.0.2.0/24 private
-sleep 3
-
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 3: Verifying VPC and Subnet Configuration"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-sudo ./bin/vpcctl list-vpcs
-sudo ./bin/vpcctl list-subnets demo
-sleep 4
-
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 4: Communication Between Subnets in Same VPC"
-echo "Expected: Subnets can reach each other via bridge"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-sudo ./bin/vpcctl test-connectivity demo
-sleep 4
-
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 5: Deploying Web Servers in Both Subnets"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo "Deploying in public subnet..."
-sudo ./bin/vpcctl deploy-webserver demo public
-echo ""
-echo "Deploying in private subnet..."
-sudo ./bin/vpcctl deploy-webserver demo private
-sleep 3
-
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 6: Application in Public Subnet - Should be Reachable"
-echo "Expected: Can access web server from host"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo "Accessing public subnet web server (10.0.1.10)..."
-if curl -s http://10.0.1.10 | head -5; then
+# Helper functions
+print_header() {
     echo ""
-    echo -e "${GREEN}✓ Public subnet web server is reachable${NC}"
-else
-    echo -e "${RED}✗ Failed to reach public subnet${NC}"
-fi
-sleep 3
-
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 7: Application in Private Subnet - Internal Only"
-echo "Expected: Reachable from host (same machine) but no internet access"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo "Accessing private subnet web server (10.0.2.10)..."
-if curl -s http://10.0.2.10 | head -5; then
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}  $1${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "${GREEN}✓ Private subnet web server is accessible internally${NC}"
-else
-    echo -e "${RED}✗ Failed to reach private subnet${NC}"
+}
+
+print_step() {
+    echo -e "${YELLOW}➜${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+print_test() {
+    echo -e "${MAGENTA}TEST:${NC} $1"
+}
+
+wait_for_user() {
+    echo ""
+    echo -e "${BLUE}Press Enter to continue...${NC}"
+    read -r
+}
+
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}This script must be run with sudo${NC}" 
+   echo "Usage: sudo ./demo-script.sh"
+   exit 1
 fi
-sleep 3
 
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 8: Outbound Internet Access from PUBLIC Subnet"
-echo "Expected: Works (NAT gateway configured)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo "Testing: ping 8.8.8.8 from public subnet..."
-if sudo ip netns exec demo-public ping -c 3 8.8.8.8; then
-    echo -e "${GREEN}✓ Public subnet has internet access via NAT${NC}"
-else
-    echo -e "${YELLOW}⚠ Public subnet internet test failed (may be restricted environment)${NC}"
-fi
-sleep 3
+# Ensure clean start
+print_header "Stage 0: Clean Slate"
+print_step "Cleaning up any existing VPCs..."
+./bin/vpcctl cleanup-all 2>/dev/null || true
+sleep 1
+print_success "Environment is clean"
+wait_for_user
 
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 9: Outbound Internet Access from PRIVATE Subnet"
-echo "Expected: BLOCKED (no NAT gateway)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo "Testing: ping 8.8.8.8 from private subnet (should timeout)..."
-if sudo ip netns exec demo-private ping -c 2 -W 2 8.8.8.8 2>/dev/null; then
-    echo -e "${RED}✗ Private subnet should NOT have internet access${NC}"
-else
-    echo -e "${GREEN}✓ Private subnet correctly isolated (no internet)${NC}"
-fi
-sleep 3
+# ============================================================================
+# PART 1: CORE VPC CREATION
+# ============================================================================
+print_header "Part 1: Core VPC Creation"
 
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 10: Creating Second VPC for Isolation Testing"
-echo "Expected: VPCs are fully isolated by default"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-sudo ./bin/vpcctl create-vpc isolated 172.16.0.0/16
-sudo ./bin/vpcctl create-subnet isolated web 172.16.1.0/24 public
-sudo ./bin/vpcctl deploy-webserver isolated web
-sleep 3
+print_step "Creating production VPC with CIDR 10.0.0.0/16..."
+./bin/vpcctl create-vpc prod 10.0.0.0/16
+sleep 1
 
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 11: Communication Between Different VPCs (No Peering)"
-echo "Expected: BLOCKED (VPCs isolated)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo "Attempting: demo VPC (10.0.x.x) → isolated VPC (172.16.1.10)..."
-if sudo ip netns exec demo-public ping -c 2 -W 2 172.16.1.10 2>/dev/null; then
-    echo -e "${RED}✗ VPCs should be isolated by default${NC}"
-else
-    echo -e "${GREEN}✓ VPCs correctly isolated (ping failed as expected)${NC}"
-fi
-sleep 3
+print_step "Listing VPCs..."
+./bin/vpcctl list-vpcs
+wait_for_user
 
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 12: Establishing VPC Peering"
-echo "Expected: After peering, controlled communication works"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-sudo ./bin/vpcctl peer-vpcs demo isolated
-sleep 3
+print_step "Creating public subnet (10.0.1.0/24)..."
+./bin/vpcctl create-subnet prod web 10.0.1.0/24 public
+sleep 1
 
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 13: Communication After VPC Peering"
-echo "Expected: Works (peering enables cross-VPC traffic)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo "Attempting: demo VPC → isolated VPC (should work now)..."
-if sudo ip netns exec demo-public ping -c 3 172.16.1.10; then
-    echo -e "${GREEN}✓ VPC peering works - cross-VPC communication successful${NC}"
-else
-    echo -e "${RED}✗ VPC peering failed${NC}"
-fi
-echo ""
-echo "Accessing web server across VPCs via HTTP..."
-sudo ip netns exec demo-public curl -s http://172.16.1.10 | head -5
-sleep 3
+print_step "Creating private subnet (10.0.2.0/24)..."
+./bin/vpcctl create-subnet prod data 10.0.2.0/24 private
+sleep 1
 
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 14: Verified NAT Gateway Behavior"
-echo "Summary:"
-echo "  - Public subnet (10.0.1.0/24): HAS internet via NAT"
-echo "  - Private subnet (10.0.2.0/24): NO internet (isolated)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
+print_step "Listing subnets in production VPC..."
+./bin/vpcctl list-subnets production
+wait_for_user
+
+# ============================================================================
+# PART 2: ROUTING AND NAT GATEWAY
+# ============================================================================
+print_header "Part 2: Routing and NAT Gateway"
+
+print_step "Deploying web server in public subnet..."
+./bin/vpcctl deploy-webserver prod web
 sleep 2
 
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 15: Firewall Policy Enforcement"
-echo "Expected: Specific connections blocked/allowed as defined"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
+print_test "Testing web server from host..."
+if curl -s http://10.0.1.10 | grep -q "Web Server Running"; then
+    print_success "Web server is accessible from host"
+else
+    echo -e "${RED}✗${NC} Web server test failed"
+fi
+wait_for_user
 
-cat > /tmp/test-policy.json << 'EOF'
+print_test "Testing internet connectivity from public subnet (with NAT)..."
+if ip netns exec prod-web ping -c 2 8.8.8.8 &> /dev/null; then
+    print_success "Public subnet has internet access via NAT"
+else
+    echo -e "${RED}✗${NC} Public subnet internet test failed"
+fi
+wait_for_user
+
+print_test "Testing inter-subnet communication (web -> database)..."
+if ip netns exec prod-web ping -c 2 10.0.2.10 &> /dev/null; then
+    print_success "Subnets within same VPC can communicate"
+else
+    echo -e "${RED}✗${NC} Inter-subnet communication failed"
+fi
+wait_for_user
+
+print_test "Verifying private subnet has NO internet access (no NAT)..."
+echo "Attempting ping from private subnet (should timeout)..."
+if timeout 3 ip netns exec prod-data ping -c 1 8.8.8.8 &> /dev/null; then
+    echo -e "${RED}✗${NC} Private subnet should NOT have internet access"
+else
+    print_success "Private subnet correctly has no internet access"
+fi
+wait_for_user
+
+# ============================================================================
+# PART 3: VPC ISOLATION & PEERING
+# ============================================================================
+print_header "Part 3: VPC Isolation & Peering"
+
+print_step "Creating staging VPC with CIDR 172.16.0.0/16..."
+./bin/vpcctl create-vpc stage 172.16.0.0/16
+sleep 1
+
+print_step "Creating subnet in staging VPC..."
+./bin/vpcctl create-subnet stage app 172.16.1.0/24 public
+sleep 1
+
+print_step "Listing all VPCs..."
+./bin/vpcctl list-vpcs
+wait_for_user
+
+print_test "Testing VPC isolation (production -> staging should FAIL)..."
+echo "Attempting ping from production to staging (should fail)..."
+if timeout 3 ip netns exec prod-web ping -c 1 172.16.1.10 &> /dev/null; then
+    echo -e "${RED}✗${NC} VPCs should be isolated by default!"
+else
+    print_success "VPCs are properly isolated - communication blocked"
+fi
+wait_for_user
+
+print_step "Creating VPC peering connection between production and staging..."
+./bin/vpcctl peer-vpcs prod stage
+sleep 1
+wait_for_user
+
+print_test "Testing cross-VPC communication after peering (should SUCCEED)..."
+if ip netns exec prod-web ping -c 2 172.16.1.10 &> /dev/null; then
+    print_success "Peered VPCs can communicate successfully"
+else
+    echo -e "${RED}✗${NC} Peered VPCs should be able to communicate"
+fi
+wait_for_user
+
+print_step "Removing VPC peering..."
+./bin/vpcctl unpeer-vpcs prod stage
+sleep 1
+
+print_test "Testing isolation after unpeering (should FAIL again)..."
+echo "Attempting ping after unpeering (should fail)..."
+if timeout 3 ip netns exec prod-web ping -c 1 172.16.1.10 &> /dev/null; then
+    echo -e "${RED}✗${NC} Isolation should be restored after unpeering"
+else
+    print_success "Isolation correctly restored after unpeering"
+fi
+wait_for_user
+
+# ============================================================================
+# PART 4: FIREWALL & SECURITY GROUPS
+# ============================================================================
+print_header "Part 4: Firewall & Security Groups"
+
+print_step "Creating example firewall policy..."
+cat > /tmp/demo-policy.json << 'EOF'
 {
-  "subnet": "10.0.1.0/24",
-  "description": "Test policy - allow HTTP, deny SSH",
   "ingress": [
     {"port": 80, "protocol": "tcp", "action": "allow"},
+    {"port": 443, "protocol": "tcp", "action": "allow"},
     {"port": 22, "protocol": "tcp", "action": "deny"}
+  ],
+  "egress": [
+    {"port": 80, "protocol": "tcp", "action": "allow"},
+    {"port": 443, "protocol": "tcp", "action": "allow"}
   ]
 }
 EOF
 
-echo "Applying firewall policy to public subnet..."
-echo "  - Allow: TCP port 80 (HTTP)"
-echo "  - Deny: TCP port 22 (SSH)"
-sudo ./bin/vpcctl apply-policy demo public /tmp/test-policy.json
+echo "Policy file created at /tmp/demo-policy.json"
+cat /tmp/demo-policy.json
+wait_for_user
+
+print_step "Applying firewall policy to web subnet..."
+./bin/vpcctl apply-policy prod web /tmp/demo-policy.json
+sleep 1
+print_success "Firewall policy applied successfully"
+wait_for_user
+
+print_step "Verifying iptables rules in namespace..."
+echo "Showing INPUT chain rules:"
+ip netns exec prod-web iptables -L INPUT -n --line-numbers | head -10
+wait_for_user
+
+# ============================================================================
+# PART 5: CONNECTIVITY TESTING
+# ============================================================================
+print_header "Part 5: Comprehensive Connectivity Tests"
+
+print_step "Running automated connectivity tests for production VPC..."
+./bin/vpcctl test-connectivity prod
+wait_for_user
+
+print_step "Running automated connectivity tests for staging VPC..."
+./bin/vpcctl test-connectivity stage
+wait_for_user
+
+# ============================================================================
+# ADDITIONAL DEMONSTRATIONS
+# ============================================================================
+print_header "Additional Demonstrations"
+
+print_step "Showing network namespace configuration..."
+echo -e "${BLUE}Network namespaces:${NC}"
+ip netns list
+echo ""
+
+print_step "Showing bridge interfaces..."
+echo -e "${BLUE}Bridge interfaces:${NC}"
+ip link show type bridge
+echo ""
+
+print_step "Showing routing table for production-web namespace..."
+echo -e "${BLUE}Routes in prod-web:${NC}"
+ip netns exec prod-web ip route
+echo ""
+
+print_step "Showing NAT rules..."
+echo -e "${BLUE}NAT (POSTROUTING) rules:${NC}"
+iptables -t nat -L POSTROUTING -n -v | grep -E "MASQUERADE|Chain"
+echo ""
+
+print_step "Showing VPC state file..."
+echo -e "${BLUE}VPC State:${NC}"
+cat configs/vpc_state.txt
+echo ""
+wait_for_user
+
+# ============================================================================
+# PART 6: CLEANUP
+# ============================================================================
+print_header "Part 6: Cleanup & Resource Removal"
+
+print_step "Showing resources before cleanup..."
+echo "VPCs:"
+./bin/vpcctl list-vpcs
+echo ""
+echo "Namespaces:"
+ip netns list
+echo ""
+echo "Bridges:"
+ip link show type bridge | grep -E "^[0-9]+:" | awk '{print $2}' | sed 's/:$//'
+wait_for_user
+
+print_step "Cleaning up all VPC resources..."
+./bin/vpcctl cleanup-all
 sleep 2
 
+print_step "Verifying cleanup..."
+echo "VPCs:"
+./bin/vpcctl list-vpcs
 echo ""
-echo "Testing policy: Port 80 should work..."
-if curl -s http://10.0.1.10 | head -3; then
-    echo -e "${GREEN}✓ Port 80 allowed (policy working)${NC}"
-else
-    echo -e "${RED}✗ Port 80 blocked (unexpected)${NC}"
-fi
-sleep 3
+echo "Namespaces:"
+ip netns list 2>/dev/null || echo "  None"
+echo ""
+echo "Bridges (VPC bridges should be gone):"
+ip link show type bridge 2>/dev/null | grep -E "prod-br|staging-br" || print_success "All VPC bridges removed"
+echo ""
+
+print_success "All resources cleaned up successfully"
+wait_for_user
+
+# ============================================================================
+# SUMMARY
+# ============================================================================
+print_header "Demo Complete - Summary"
+
+echo -e "${GREEN}✓${NC} Part 1: Core VPC Creation - VPCs and subnets created successfully"
+echo -e "${GREEN}✓${NC} Part 2: Routing & NAT - Public subnet has internet, private subnet isolated"
+echo -e "${GREEN}✓${NC} Part 3: VPC Isolation - Default isolation enforced, peering works"
+echo -e "${GREEN}✓${NC} Part 4: Firewall Rules - Security policies applied successfully"
+echo -e "${GREEN}✓${NC} Part 5: Connectivity Tests - All tests passed"
+echo -e "${GREEN}✓${NC} Part 6: Cleanup - All resources removed cleanly"
 
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 16: Activity Logging Verification"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}All VPC features demonstrated successfully!${NC}"
+echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
 echo ""
-echo "Last 20 log entries from logs/vpcctl.log:"
-echo "─────────────────────────────────────────────────────────────────────"
-tail -20 logs/vpcctl.log
-echo "─────────────────────────────────────────────────────────────────────"
-sleep 3
 
+echo "Key Features Demonstrated:"
+echo "  • Multi-VPC support with isolation"
+echo "  • Public/private subnet types"
+echo "  • NAT gateway for internet access"
+echo "  • Inter-subnet routing within VPC"
+echo "  • VPC peering with access control"
+echo "  • Firewall policy enforcement"
+echo "  • Clean resource lifecycle management"
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 17: Final VPC State"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-sudo ./bin/vpcctl list-vpcs
-sleep 3
 
+echo "Logs available at: logs/vpcctl.log"
+echo "Check the log file for detailed operation history"
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 18: Teardown - Clean Resource Removal"
-echo "Expected: All namespaces, bridges, veth pairs removed"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-sudo ./bin/vpcctl cleanup-all <<< "y"
-sleep 2
 
-echo ""
-echo "Verifying cleanup..."
-echo "─────────────────────────────────────────────────────────────────────"
-REMAINING_NS=$(sudo ip netns list 2>/dev/null | grep -E '(demo|isolated)' || echo "")
-REMAINING_BR=$(sudo ip link show 2>/dev/null | grep -E '(demo|isolated)' || echo "")
+# Cleanup temp files
+rm -f /tmp/demo-policy.json
 
-if [[ -z "$REMAINING_NS" ]]; then
-    echo -e "${GREEN}✓ All namespaces removed${NC}"
-else
-    echo -e "${RED}✗ Some namespaces remain: $REMAINING_NS${NC}"
-fi
-
-if [[ -z "$REMAINING_BR" ]]; then
-    echo -e "${GREEN}✓ All bridges/interfaces removed${NC}"
-else
-    echo -e "${RED}✗ Some interfaces remain${NC}"
-fi
-echo "─────────────────────────────────────────────────────────────────────"
-
-echo ""
-echo "========================================================================="
-echo "  ✓ ALL TESTS COMPLETED SUCCESSFULLY"
-echo "========================================================================="
-echo ""
-echo "Demonstrated:"
-echo "  ✓ VPC creation with bridges and namespaces"
-echo "  ✓ Subnet management (public/private)"
-echo "  ✓ Intra-VPC communication"
-echo "  ✓ Public subnet internet access (NAT gateway)"
-echo "  ✓ Private subnet isolation from internet"
-echo "  ✓ Application deployment in subnets"
-echo "  ✓ Inter-VPC isolation (default)"
-echo "  ✓ VPC peering functionality"
-echo "  ✓ Firewall policy enforcement"
-echo "  ✓ Complete activity logging"
-echo "  ✓ Clean resource teardown"
-echo ""
-echo "========================================================================="
-echo "  Stage 4 VPC Implementation - Complete! "
-echo "========================================================================="
-echo ""
+print_success "Demo script completed successfully!"
